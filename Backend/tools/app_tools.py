@@ -35,11 +35,12 @@ def open_application(app_name: str) -> str:
     """
     try:
         if sys.platform == "win32":
-            result = subprocess.Popen(["start", "", app_name], shell=True)
+            # shell=True + string command is the correct way for 'start' on Windows
+            subprocess.Popen(f'start "" "{app_name}"', shell=True)
         elif sys.platform == "darwin":
-            result = subprocess.Popen(["open", "-a", app_name])
+            subprocess.Popen(["open", "-a", app_name])
         else:
-            result = subprocess.Popen(["xdg-open", app_name])
+            subprocess.Popen(["xdg-open", app_name])
         return f"Opened {app_name} successfully."
     except Exception as exc:
         return f"Could not open '{app_name}': {exc}"
@@ -81,7 +82,7 @@ def open_chrome(url: str = "") -> str:
     """
     try:
         if sys.platform == "win32":
-            cmd = ["chrome", url] if url else ["chrome"]
+            cmd = f'start "" chrome "{url}"' if url else 'start "" chrome'
             subprocess.Popen(cmd, shell=True)
         elif sys.platform == "darwin":
             cmd = ["open", "-a", "Google Chrome", url] if url else ["open", "-a", "Google Chrome"]
@@ -104,7 +105,7 @@ def open_spotify() -> str:
     """
     try:
         if sys.platform == "win32":
-            subprocess.Popen(["spotify"], shell=True)
+            subprocess.Popen('start "" spotify', shell=True)
         elif sys.platform == "darwin":
             subprocess.Popen(["open", "-a", "Spotify"])
         else:

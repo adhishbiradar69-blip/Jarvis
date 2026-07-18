@@ -104,7 +104,8 @@ def shutdown_computer(delay_seconds: int = 60) -> str:
     """
     try:
         if sys.platform == "win32":
-            subprocess.run(["shutdown", "/s", f"/t {delay_seconds}"], check=True)
+            # /t takes the value as a separate token, not combined
+            subprocess.run(["shutdown", "/s", "/t", str(delay_seconds)], check=True)
         elif sys.platform == "darwin":
             subprocess.run(["sudo", "shutdown", "-h", f"+{delay_seconds // 60}"], check=True)
         else:
@@ -124,7 +125,7 @@ def restart_computer(delay_seconds: int = 60) -> str:
     """
     try:
         if sys.platform == "win32":
-            subprocess.run(["shutdown", "/r", f"/t {delay_seconds}"], check=True)
+            subprocess.run(["shutdown", "/r", "/t", str(delay_seconds)], check=True)
         elif sys.platform == "darwin":
             subprocess.run(["sudo", "shutdown", "-r", f"+{delay_seconds // 60}"], check=True)
         else:

@@ -1,26 +1,26 @@
 """
-ai.py — LangChain + Groq tool-calling engine for Jarvis.
+ai.py — Refactored LangChain + Groq engine for Jarvis. (v3)
 
-v2 changes:
-  - LLM is bound to ALL_TOOLS via llm.bind_tools()
-  - generate_response() runs a tool-calling loop:
-      1. Ask LLM (with tools available)
-      2. If LLM picks a tool → execute it → feed result back → ask LLM again
-      3. If LLM replies directly → return the text
-  - Memory context is sent as list[BaseMessage] (native LangChain objects)
-  - Summarisation / profile update calls remain plain text (no tools needed there)
-
-Future extension points (marked with # FUTURE):
-  - RAG: inject retrieved docs into build_messages() before the loop
-  - Vision: add image content blocks to the HumanMessage
-  - Streaming: add streaming=True and a StreamingCallbackHandler
-  - Agents: replace the tool loop with a LangChain AgentExecutor
-  - Multiple LLM providers: swap ChatGroq for ChatOpenAI / ChatAnthropic etc.
-  - MCP Servers: add MCP tool wrappers to ALL_TOOLS in tools/__init__.py
+Key changes from v2:
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ Problem → Fix                                                       │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │ P1  Unnecessary tool calls     → tool_choice="auto" + system hint  │
+  │ P2  Too many LLM calls         → max 2 calls (decide + finalise)   │
+  │ P3  Profile update every turn  → heuristic filter before calling   │
+  │ P4  Summarisation always runs  → only when threshold truly reached │
+  │ P5  429 crashes assistant      → groq RateLimitError caught        │
+  │ P6  Loop calls LLM after each  → execute ALL tools, then ONE call  │
+  │ P7  Infinite tool loop         → MAX_TOOL_ROUNDS = 3               │
+  │ P8  Duplicate tool execution   → executed_set dedup per request    │
+  │ P9  Tool schema failures       → validated @tool signatures        │
+  │ P10 Memory save timing         → persisted before any maintenance  │
+  └─────────────────────────────────────────────────────────────────────┘
 """
 
 import os
 import json
+import re
 from typing import Any
 
 from dotenv import load_dotenv
@@ -33,7 +33,7 @@ from langchain_core.messages import (
 )
 
 from memory import MemoryManager
-from tools import ALL_TOOLS  # single import; new tools are added in tools/__init__.py
+from tools import ALL_TOOLS
 
 # ── Environment ────────────────────────────────────────────────────────────────
 
@@ -43,39 +43,75 @@ GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 if not GROQ_API_KEY:
     raise EnvironmentError("GROQ_API_KEY is not set. Add it to your .env file.")
 
-# ── Model initialisation ───────────────────────────────────────────────────────
+# ── Constants ──────────────────────────────────────────────────────────────────
 
 MODEL_NAME: str = "llama-3.1-8b-instant"
 
-# Base LLM — no tools bound yet
+# Fix P7: hard cap on how many tool-execution rounds can happen per request.
+# Round = one LLM response that contains tool calls.
+# After MAX_TOOL_ROUNDS we stop and ask the LLM to reply with whatever it has.
+MAX_TOOL_ROUNDS: int = 3
+
+# Words that hint a message probably contains long-term-worthy information.
+# Used by the profile-update heuristic (Fix P3).
+_PROFILE_HINT_WORDS: frozenset[str] = frozenset({
+    "name", "called", "prefer", "favourite", "favorite", "language", "project",
+    "building", "working", "goal", "always", "never", "like", "love", "hate",
+    "editor", "vscode", "vim", "style", "reminder", "remember",
+})
+
+# ── Model initialisation ───────────────────────────────────────────────────────
+
 _base_llm: ChatGroq = ChatGroq(
     model=MODEL_NAME,
     api_key=GROQ_API_KEY,
     temperature=0.7,
     max_tokens=1024,
-    # FUTURE: add streaming=True + callback_manager=[StreamingHandler()] for TTS
+    # FUTURE: streaming=True + callback_manager for TTS
 )
 
-# Tool-aware LLM — used for all user-facing calls
-# bind_tools() tells the model which tools exist and what their signatures are
-_llm = _base_llm.bind_tools(ALL_TOOLS)
+# Tool-aware LLM.
+# tool_choice="auto" tells Groq: use tools only when genuinely needed.
+# This is the primary fix for P1 (unnecessary tool calls).
+_llm = _base_llm.bind_tools(ALL_TOOLS, tool_choice="auto")
 
-# Plain LLM (no tools) — used for summarisation / profile extraction
-# We don't want the model trying to call tools during memory maintenance
+# Plain LLM used only for summarisation and compression — never for user turns.
 _plain_llm = _base_llm
+
+# Tool dispatch map built once at startup.
+_tool_map: dict[str, Any] = {t.name: t for t in ALL_TOOLS}
+
+
+# ── Groq error handling ────────────────────────────────────────────────────────
+
+def _is_rate_limit(exc: Exception) -> bool:
+    """Return True if the exception is a Groq 429 rate-limit error (Fix P5)."""
+    msg = str(exc).lower()
+    return "429" in msg or "rate limit" in msg or "rate_limit" in msg
+
+
+def _call_llm_safe(messages: list[BaseMessage], use_tools: bool = True) -> AIMessage | None:
+    """
+    Invoke the LLM and handle common errors gracefully (Fix P5).
+
+    Returns the AIMessage on success, or None on unrecoverable error.
+    Prints a user-friendly message instead of crashing.
+    """
+    llm = _llm if use_tools else _plain_llm
+    try:
+        return llm.invoke(messages)
+    except Exception as exc:
+        if _is_rate_limit(exc):
+            print("\n[Jarvis] Groq rate limit reached. Please wait a few seconds and try again.\n")
+        else:
+            print(f"\n[Jarvis] LLM error: {exc}\n")
+        return None
 
 
 # ── Tool execution ─────────────────────────────────────────────────────────────
 
-# Map tool names → callable objects (built from ALL_TOOLS at startup)
-_tool_map: dict[str, Any] = {t.name: t for t in ALL_TOOLS}
-
-
 def _execute_tool_call(tool_name: str, tool_args: dict) -> str:
-    """
-    Look up a tool by name and invoke it with the given arguments.
-    Returns a string result (or error message) to feed back to the LLM.
-    """
+    """Invoke a tool by name and return its string result (Fix P9)."""
     tool_fn = _tool_map.get(tool_name)
     if tool_fn is None:
         return f"Error: unknown tool '{tool_name}'"
@@ -86,75 +122,94 @@ def _execute_tool_call(tool_name: str, tool_args: dict) -> str:
         return f"Tool '{tool_name}' raised an error: {exc}"
 
 
-# ── Tool-calling loop ──────────────────────────────────────────────────────────
+def _tool_dedup_key(tool_call: dict) -> str:
+    """Build a hashable key for deduplication (Fix P8)."""
+    return f"{tool_call['name']}::{json.dumps(tool_call.get('args', {}), sort_keys=True)}"
+
+
+# ── Core tool-calling loop ─────────────────────────────────────────────────────
 
 def _run_tool_loop(messages: list[BaseMessage]) -> str:
     """
-    Core agentic loop:
+    Optimised tool-calling loop (Fixes P2, P6, P7, P8).
 
-      while True:
-        1. Send messages to LLM (with tools bound)
-        2. If LLM returns tool_calls → execute each tool → append ToolMessage → continue
-        3. If LLM returns a text reply → return it
+    Algorithm (max 2 LLM calls for a tool request):
 
-    The loop handles multiple consecutive tool calls (e.g. open app, then screenshot).
-    Max iterations cap prevents infinite loops.
+      Round 1 — Decision call:
+        Send messages → LLM
+        If no tool_calls → return text immediately (1 LLM call total).
+        If tool_calls    → execute ALL of them in one batch (no extra LLM call).
 
-    Args:
-        messages: The full conversation so far as LangChain message objects.
+      Round 2 — Finalisation call (only if tools were used):
+        Append all ToolMessages → LLM → return text.
 
-    Returns:
-        The final text reply from the assistant.
+      Extra rounds (up to MAX_TOOL_ROUNDS):
+        Only if the finalisation response itself requests more tools.
+        Extremely rare; the cap (default 3) prevents infinite loops.
+
+    Deduplication (Fix P8):
+        A set tracks (tool_name, args) pairs. The same call is never repeated.
     """
-    MAX_ITERATIONS = 8  # safety cap
-    loop_messages = list(messages)  # don't mutate caller's list
+    loop_messages = list(messages)           # don't mutate caller's list
+    executed: set[str] = set()               # dedup tracker for this request
 
-    for _ in range(MAX_ITERATIONS):
-        try:
-            response: AIMessage = _llm.invoke(loop_messages)
-        except Exception as exc:
-            print(f"[ai.py] LLM call failed: {exc}")
-            return "I ran into an error reaching the AI. Please try again."
+    for round_num in range(MAX_TOOL_ROUNDS):
+        response = _call_llm_safe(loop_messages, use_tools=True)
+        if response is None:
+            return "I couldn't reach the AI right now. Please try again in a moment."
 
-        # If the LLM made tool calls, execute them and loop back
-        if response.tool_calls:
-            # Append the assistant's tool-call message to history
-            loop_messages.append(response)
+        # ── No tool calls → plain text reply → done (1 LLM call) ──────────────
+        if not response.tool_calls:
+            return response.content.strip() if response.content else ""
 
-            # Execute every tool the LLM requested (may be multiple in one turn)
-            for tool_call in response.tool_calls:
-                result = _execute_tool_call(
-                    tool_name=tool_call["name"],
-                    tool_args=tool_call["args"],
-                )
-                print(f"[Tool] {tool_call['name']}({tool_call['args']}) → {result[:120]}")
+        # ── Tool calls present → execute the whole batch ───────────────────────
+        loop_messages.append(response)  # add assistant's tool-call message
 
-                # Feed the result back as a ToolMessage (required by LangChain)
-                loop_messages.append(
-                    ToolMessage(
-                        content=result,
-                        tool_call_id=tool_call["id"],
-                    )
-                )
-            # Loop: the LLM will now see the tool results and reply
-            continue
+        any_executed = False
+        for tool_call in response.tool_calls:
+            key = _tool_dedup_key(tool_call)
 
-        # No tool calls → plain text reply → we're done
-        return response.content.strip() if response.content else ""
+            # Fix P8: skip duplicate calls silently
+            if key in executed:
+                print(f"[Tool] Skipping duplicate: {tool_call['name']}")
+                # Still need a ToolMessage placeholder so the message sequence is valid
+                loop_messages.append(ToolMessage(
+                    content="(skipped: already executed this call)",
+                    tool_call_id=tool_call["id"],
+                ))
+                continue
 
+            executed.add(key)
+            result = _execute_tool_call(tool_call["name"], tool_call.get("args", {}))
+            print(f"[Tool] {tool_call['name']}({tool_call.get('args', {})}) → {result[:120]}")
+
+            loop_messages.append(ToolMessage(
+                content=result,
+                tool_call_id=tool_call["id"],
+            ))
+            any_executed = True
+
+        # If we hit the round cap, do one final LLM call and exit
+        if round_num == MAX_TOOL_ROUNDS - 1:
+            print(f"[Jarvis] Tool round cap ({MAX_TOOL_ROUNDS}) reached. Finalising.")
+            final = _call_llm_safe(loop_messages, use_tools=False)
+            if final is None:
+                return "I ran into an error while finalising the response."
+            return final.content.strip() if final.content else ""
+
+        # Otherwise loop back (round 2 will usually be the final text reply)
+        # This covers the rare case where the LLM requests a second batch of tools
+
+    # Should never reach here, but just in case
     return "I reached the maximum number of steps. Please try again."
 
 
-# ── Helper LLM calls (no tools) ───────────────────────────────────────────────
+# ── Memory maintenance helpers ─────────────────────────────────────────────────
 
 def _call_plain(prompt: str) -> str:
-    """Call the LLM without tools for memory maintenance tasks."""
-    try:
-        response = _plain_llm.invoke([HumanMessage(content=prompt)])
-        return response.content.strip()
-    except Exception as exc:
-        print(f"[ai.py] Plain LLM call failed: {exc}")
-        return ""
+    """Call the plain (no-tool) LLM for memory tasks. Returns '' on failure."""
+    response = _call_llm_safe([HumanMessage(content=prompt)], use_tools=False)
+    return response.content.strip() if response and response.content else ""
 
 
 def _build_summary_prompt(messages: list[dict]) -> str:
@@ -176,7 +231,7 @@ def _build_compression_prompt(summaries: list[dict]) -> str:
     )
     return (
         "You are a memory compression assistant.\n"
-        "Merge the following summaries into a single, dense summary.\n"
+        "Merge the following summaries into one dense summary.\n"
         "Rules:\n"
         "- Eliminate duplicates.\n"
         "- Preserve every unique fact, goal, project, and decision.\n"
@@ -189,29 +244,47 @@ def _build_profile_update_prompt(current_profile: dict, recent_exchange: str) ->
     profile_str = json.dumps(current_profile, indent=2, ensure_ascii=False)
     return (
         "You are a user-profile extraction assistant.\n"
-        "Given the current user profile and the latest conversation, "
-        "extract any NEW durable facts that should be remembered permanently.\n\n"
+        "Extract any NEW durable facts from the exchange below.\n"
         "Rules:\n"
-        "- Only include genuinely long-term information (name, language preferences, "
-        "ongoing projects, permanent goals, coding style, etc.).\n"
-        "- Do NOT include temporary info (today's task, what they ate, etc.).\n"
-        "- If nothing new was discovered, return an empty JSON object: {}\n"
-        "- Return ONLY valid JSON. No explanation, no markdown fences.\n\n"
+        "- Long-term only: name, language preferences, ongoing projects, goals, coding style.\n"
+        "- Skip temporary info (today's task, casual chat, questions, greetings).\n"
+        "- Return ONLY valid JSON. Empty object {} if nothing new.\n"
+        "- No markdown fences, no explanation.\n\n"
         f"CURRENT PROFILE:\n{profile_str}\n\n"
-        f"LATEST EXCHANGE:\n{recent_exchange}\n\nNEW FACTS (JSON):"
+        f"EXCHANGE:\n{recent_exchange}\n\nNEW FACTS (JSON):"
     )
+
+
+# ── Profile-update heuristic (Fix P3) ─────────────────────────────────────────
+
+def _exchange_may_contain_profile_info(user_message: str) -> bool:
+    """
+    Cheap local check: does this message plausibly contain long-term facts?
+
+    We scan for hint words (no LLM call). If none match, we skip the
+    profile-extraction LLM call entirely. This eliminates the extra call for
+    greetings, math questions, tool requests, casual chat, etc.
+    """
+    words = set(re.findall(r"\b\w+\b", user_message.lower()))
+    return bool(words & _PROFILE_HINT_WORDS)
 
 
 # ── Memory lifecycle ───────────────────────────────────────────────────────────
 
 def _maybe_summarize(memory: MemoryManager) -> None:
-    """Summarise recent messages if the window is full; compress if needed."""
+    """
+    Summarise and optionally compress only when the threshold is actually reached.
+    The threshold check is a fast local JSON read — no LLM call unless needed.
+    (Fix P4)
+    """
     if not memory.should_summarize():
-        return
+        return  # ← most calls exit here with zero LLM usage
+
     print("[Jarvis] Compressing conversation memory…")
     summary = _call_plain(_build_summary_prompt(memory.get_recent_messages()))
     if summary:
         memory.append_summary(summary)
+
     if memory.needs_compression():
         print("[Jarvis] Merging old summaries…")
         compressed = _call_plain(_build_compression_prompt(memory.get_all_summaries()))
@@ -224,7 +297,13 @@ def _maybe_update_profile(
     user_message: str,
     assistant_reply: str,
 ) -> None:
-    """Extract new permanent facts from the latest exchange and update profile.json."""
+    """
+    Update profile.json only if the heuristic suggests new facts exist.
+    (Fix P3)
+    """
+    if not _exchange_may_contain_profile_info(user_message):
+        return  # ← skip the LLM call entirely for greetings, tool calls, etc.
+
     exchange = f"USER: {user_message}\nASSISTANT: {assistant_reply}"
     raw = _call_plain(_build_profile_update_prompt(memory.get_profile(), exchange))
     if not raw:
@@ -244,34 +323,36 @@ def generate_response(user_message: str, memory: MemoryManager) -> str:
     """
     Main entry point called from main.py.
 
-    Flow:
-      1. Build context as list[BaseMessage] (profile + summaries + recent + current)
-      2. Run the tool-calling loop (LLM decides if tools are needed)
-      3. Persist user message and assistant reply to recent.json
-      4. Optionally update user profile
-      5. Optionally trigger summarisation / compression
-      6. Return the final text reply
+    Typical call cost:
+      Normal conversation → 1 LLM call
+      Tool request        → 2 LLM calls  (decide + finalise)
+      Profile update      → +1 only when hint words detected in user message
+      Summarisation       → +1 only when recent.json hits SUMMARY_TRIGGER
 
-    The tool-calling loop is transparent to main.py — it just receives the
-    final text response regardless of how many tool calls happened internally.
+    Flow:
+      1. Build messages (profile + summaries + recent window + current)
+      2. Run optimised tool loop
+      3. Persist IMMEDIATELY (Fix P10) — before any maintenance
+      4. Conditionally update profile (Fix P3)
+      5. Conditionally summarise (Fix P4)
+      6. Return reply
 
     Future extension points:
-      - RAG: build_messages() can accept retrieved_docs parameter
-      - Vision: add image content to the HumanMessage before the loop
-      - TTS: call your speech engine on the returned reply in main.py
-      - Streaming: replace _run_tool_loop with a streaming equivalent
+      - RAG: pass retrieved_docs into build_messages()
+      - Vision: add image content blocks to the final HumanMessage
+      - Streaming: swap _run_tool_loop for a streaming variant
+      - Agents: replace _run_tool_loop with AgentExecutor
+      - MCP: add MCP tool wrappers to tools/__init__.py ALL_TOOLS
     """
-    # Build native message list
     messages: list[BaseMessage] = memory.build_messages(user_message)
 
-    # Run tool-calling loop (handles 0 or many tool calls transparently)
     reply: str = _run_tool_loop(messages)
 
-    # Persist both sides of the exchange immediately (crash-safe)
+    # Fix P10: persist BOTH sides immediately — before any other work
     memory.add_message("user", user_message)
     memory.add_message("assistant", reply)
 
-    # Background memory maintenance
+    # Conditional maintenance — each skips gracefully when not needed
     _maybe_update_profile(memory, user_message, reply)
     _maybe_summarize(memory)
 

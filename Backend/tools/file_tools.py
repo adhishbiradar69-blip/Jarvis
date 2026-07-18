@@ -159,18 +159,19 @@ def rename_file(file_path: str, new_name: str) -> str:
 
 
 @tool
-def delete_file(file_path: str, confirmed: bool = False) -> str:
+def delete_file(file_path: str, confirmed: str = "no") -> str:
     """
-    Delete a file or empty folder. The user MUST confirm before this runs.
-    If confirmed is False, return a confirmation request instead of deleting.
+    Delete a file or folder permanently.
+    IMPORTANT: You must ask the user "Are you sure you want to delete X?" first.
+    Only call this tool with confirmed='yes' after the user explicitly confirms.
+    If the user has NOT confirmed yet, call with confirmed='no' to show a warning.
 
     Args:
         file_path: Path to the file or folder to delete.
-        confirmed: Must be True for deletion to proceed. Default is False (safe).
+        confirmed: 'yes' to proceed with deletion, 'no' to show a confirmation prompt.
     """
     path = Path(_expand(file_path))
-    if not confirmed:
-        # The LLM should present this message to the user and wait for "yes"
+    if confirmed.strip().lower() != "yes":
         return (
             f"⚠️ Are you sure you want to delete '{path}'? "
             "This cannot be undone. Reply 'yes, delete it' to confirm."
