@@ -8,12 +8,18 @@ Architecture:
 
 Design goal: send the *minimum* tokens needed to give the model enough context,
 while never losing important information across sessions.
+
+v2 change: build_messages() now returns list[BaseMessage] (native LangChain objects)
+instead of a single flat string. This enables proper tool-calling message sequences
+and keeps memory of past tool calls intact.
 """
 
 import json
 import os
 from datetime import datetime
 from typing import Any
+
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -173,43 +179,75 @@ class MemoryManager:
 
     # ── Context Builder ────────────────────────────────────────────────────────
 
-    def build_context(self, current_user_message: str) -> str:
+    def build_messages(self, current_user_message: str) -> list[BaseMessage]:
         """
-        Assemble the prompt context in this order (lowest → highest recency):
-          1. User profile  (durable facts — very compact)
-          2. Recent summaries  (compressed history — at most 3)
-          3. Last 10 messages  (recent verbatim exchange)
-          4. Current user message
+        Assemble the conversation as a list of native LangChain BaseMessage objects.
 
-        This ordering keeps total token count minimal while giving the model
-        the most relevant context at the top of its attention.
+        Message order (oldest → newest, matching LLM expectations):
+          1. HumanMessage with profile + summaries as context preamble
+          2. AIMessage acknowledging the context  (keeps roles alternating cleanly)
+          3. Alternating HumanMessage / AIMessage from recent window
+          4. HumanMessage with the current user message
+
+        Why messages instead of a string?
+          - The LLM's tool-calling API requires proper message objects.
+          - ToolMessage responses (tool results) slot naturally into this list.
+          - Future RAG docs can be prepended to the preamble HumanMessage.
+          - Future multi-turn tool calls maintain correct role alternation.
+
+        Token efficiency is preserved: only profile + 3 summaries + 10 messages
+        are ever sent, regardless of how long the conversation history is.
         """
-        parts: list[str] = []
+        messages: list[BaseMessage] = []
 
-        # 1. Profile
+        # ── Build context preamble (profile + summaries) ───────────────────────
+        preamble_parts: list[str] = []
+
         profile = self.get_profile()
         if profile:
             profile_str = json.dumps(profile, indent=2, ensure_ascii=False)
-            parts.append(f"[USER PROFILE]\n{profile_str}")
+            preamble_parts.append(f"[USER PROFILE]\n{profile_str}")
 
-        # 2. Recent summaries
         summaries = self.get_recent_summaries()
         if summaries:
             summary_lines = "\n\n".join(
                 f"Summary ({s.get('created_at', '')[:10]}):\n{s['summary']}"
                 for s in summaries
             )
-            parts.append(f"[CONVERSATION HISTORY — SUMMARIES]\n{summary_lines}")
+            preamble_parts.append(f"[CONVERSATION HISTORY — SUMMARIES]\n{summary_lines}")
 
-        # 3. Recent message window
-        recent = self._get_recent_window()
-        if recent:
-            dialog = "\n".join(
-                f"{m['role'].upper()}: {m['content']}" for m in recent
+        if preamble_parts:
+            preamble_text = (
+                "Here is context about the user and our past conversations:\n\n"
+                + "\n\n".join(preamble_parts)
             )
-            parts.append(f"[RECENT MESSAGES]\n{dialog}")
+            # Inject as the first human turn; the AI acknowledges it briefly.
+            messages.append(HumanMessage(content=preamble_text))
+            messages.append(AIMessage(content="Understood. I have your profile and conversation history in mind."))
 
-        # 4. Current message
-        parts.append(f"[CURRENT USER MESSAGE]\n{current_user_message}")
+        # ── Replay recent conversation window ──────────────────────────────────
+        recent = self._get_recent_window()
+        for msg in recent:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            else:
+                messages.append(AIMessage(content=content))
 
-        return "\n\n".join(parts)
+        # ── Current user message ───────────────────────────────────────────────
+        messages.append(HumanMessage(content=current_user_message))
+
+        return messages
+
+    # Keep the old method as an alias so nothing breaks if it's called elsewhere
+    def build_context(self, current_user_message: str) -> str:
+        """
+        Deprecated: returns a flat string version of the context.
+        Kept for backward compatibility. Prefer build_messages().
+        """
+        msgs = self.build_messages(current_user_message)
+        return "\n".join(
+            f"{'USER' if isinstance(m, HumanMessage) else 'ASSISTANT'}: {m.content}"
+            for m in msgs
+        )

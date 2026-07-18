@@ -1,20 +1,22 @@
 """
-ai.py — LangChain + Groq integration for the Jarvis backend.
+ai.py — LangChain + Groq tool-calling engine for Jarvis.
 
-Responsibilities:
-  - Initialise the Groq LLM via LangChain
-  - Generate responses using memory context
-  - Trigger summarisation / compression / profile updates when needed
+v2 changes:
+  - LLM is bound to ALL_TOOLS via llm.bind_tools()
+  - generate_response() runs a tool-calling loop:
+      1. Ask LLM (with tools available)
+      2. If LLM picks a tool → execute it → feed result back → ask LLM again
+      3. If LLM replies directly → return the text
+  - Memory context is sent as list[BaseMessage] (native LangChain objects)
+  - Summarisation / profile update calls remain plain text (no tools needed there)
 
-All LLM calls live here or in memory.py (for summarisation helpers called from here).
-No LLM logic belongs in main.py.
-
-Designed for easy future expansion:
-  - Tool/function calling: add a tools= list to the model invocation
-  - RAG: inject retrieved docs into build_context() before calling generate_response()
-  - Vision: pass image content blocks alongside text
-  - Agents: swap HumanMessage chain for an AgentExecutor
-  - MCP / multi-agent: add orchestration layer above generate_response()
+Future extension points (marked with # FUTURE):
+  - RAG: inject retrieved docs into build_messages() before the loop
+  - Vision: add image content blocks to the HumanMessage
+  - Streaming: add streaming=True and a StreamingCallbackHandler
+  - Agents: replace the tool loop with a LangChain AgentExecutor
+  - Multiple LLM providers: swap ChatGroq for ChatOpenAI / ChatAnthropic etc.
+  - MCP Servers: add MCP tool wrappers to ALL_TOOLS in tools/__init__.py
 """
 
 import os
@@ -23,58 +25,140 @@ from typing import Any
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import (
+    BaseMessage,
+    HumanMessage,
+    AIMessage,
+    ToolMessage,
+)
 
 from memory import MemoryManager
+from tools import ALL_TOOLS  # single import; new tools are added in tools/__init__.py
 
-# ── Env ────────────────────────────────────────────────────────────────────────
+# ── Environment ────────────────────────────────────────────────────────────────
 
 load_dotenv()
 
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 if not GROQ_API_KEY:
-    raise EnvironmentError(
-        "GROQ_API_KEY is not set. Add it to your .env file."
-    )
+    raise EnvironmentError("GROQ_API_KEY is not set. Add it to your .env file.")
 
-# ── Model ──────────────────────────────────────────────────────────────────────
+# ── Model initialisation ───────────────────────────────────────────────────────
 
 MODEL_NAME: str = "llama-3.1-8b-instant"
 
-# Initialised once at import time; reused for every call (cheap, stateless object)
-_llm: ChatGroq = ChatGroq(
+# Base LLM — no tools bound yet
+_base_llm: ChatGroq = ChatGroq(
     model=MODEL_NAME,
     api_key=GROQ_API_KEY,
     temperature=0.7,
     max_tokens=1024,
-    # Future: add streaming=True and a callback handler when you add TTS/streaming UI
+    # FUTURE: add streaming=True + callback_manager=[StreamingHandler()] for TTS
 )
 
+# Tool-aware LLM — used for all user-facing calls
+# bind_tools() tells the model which tools exist and what their signatures are
+_llm = _base_llm.bind_tools(ALL_TOOLS)
 
-# ── Internal helpers ───────────────────────────────────────────────────────────
+# Plain LLM (no tools) — used for summarisation / profile extraction
+# We don't want the model trying to call tools during memory maintenance
+_plain_llm = _base_llm
 
-def _call_llm(prompt: str) -> str:
+
+# ── Tool execution ─────────────────────────────────────────────────────────────
+
+# Map tool names → callable objects (built from ALL_TOOLS at startup)
+_tool_map: dict[str, Any] = {t.name: t for t in ALL_TOOLS}
+
+
+def _execute_tool_call(tool_name: str, tool_args: dict) -> str:
     """
-    Send a single-turn prompt to the model and return the text response.
-    All Groq calls funnel through here so error handling is centralised.
+    Look up a tool by name and invoke it with the given arguments.
+    Returns a string result (or error message) to feed back to the LLM.
     """
+    tool_fn = _tool_map.get(tool_name)
+    if tool_fn is None:
+        return f"Error: unknown tool '{tool_name}'"
     try:
-        response = _llm.invoke([HumanMessage(content=prompt)])
+        result = tool_fn.invoke(tool_args)
+        return str(result)
+    except Exception as exc:
+        return f"Tool '{tool_name}' raised an error: {exc}"
+
+
+# ── Tool-calling loop ──────────────────────────────────────────────────────────
+
+def _run_tool_loop(messages: list[BaseMessage]) -> str:
+    """
+    Core agentic loop:
+
+      while True:
+        1. Send messages to LLM (with tools bound)
+        2. If LLM returns tool_calls → execute each tool → append ToolMessage → continue
+        3. If LLM returns a text reply → return it
+
+    The loop handles multiple consecutive tool calls (e.g. open app, then screenshot).
+    Max iterations cap prevents infinite loops.
+
+    Args:
+        messages: The full conversation so far as LangChain message objects.
+
+    Returns:
+        The final text reply from the assistant.
+    """
+    MAX_ITERATIONS = 8  # safety cap
+    loop_messages = list(messages)  # don't mutate caller's list
+
+    for _ in range(MAX_ITERATIONS):
+        try:
+            response: AIMessage = _llm.invoke(loop_messages)
+        except Exception as exc:
+            print(f"[ai.py] LLM call failed: {exc}")
+            return "I ran into an error reaching the AI. Please try again."
+
+        # If the LLM made tool calls, execute them and loop back
+        if response.tool_calls:
+            # Append the assistant's tool-call message to history
+            loop_messages.append(response)
+
+            # Execute every tool the LLM requested (may be multiple in one turn)
+            for tool_call in response.tool_calls:
+                result = _execute_tool_call(
+                    tool_name=tool_call["name"],
+                    tool_args=tool_call["args"],
+                )
+                print(f"[Tool] {tool_call['name']}({tool_call['args']}) → {result[:120]}")
+
+                # Feed the result back as a ToolMessage (required by LangChain)
+                loop_messages.append(
+                    ToolMessage(
+                        content=result,
+                        tool_call_id=tool_call["id"],
+                    )
+                )
+            # Loop: the LLM will now see the tool results and reply
+            continue
+
+        # No tool calls → plain text reply → we're done
+        return response.content.strip() if response.content else ""
+
+    return "I reached the maximum number of steps. Please try again."
+
+
+# ── Helper LLM calls (no tools) ───────────────────────────────────────────────
+
+def _call_plain(prompt: str) -> str:
+    """Call the LLM without tools for memory maintenance tasks."""
+    try:
+        response = _plain_llm.invoke([HumanMessage(content=prompt)])
         return response.content.strip()
     except Exception as exc:
-        # Never crash the assistant on a single failed API call
-        print(f"[ai.py] LLM call failed: {exc}")
-        return "I encountered an error reaching the AI. Please try again."
+        print(f"[ai.py] Plain LLM call failed: {exc}")
+        return ""
 
 
 def _build_summary_prompt(messages: list[dict]) -> str:
-    """
-    Build a prompt that asks the model to summarise a batch of messages.
-    The output is stored in summaries.json — keep it dense and factual.
-    """
-    dialog = "\n".join(
-        f"{m['role'].upper()}: {m['content']}" for m in messages
-    )
+    dialog = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
     return (
         "You are a memory compression assistant.\n"
         "Summarise the following conversation for long-term storage.\n"
@@ -82,15 +166,11 @@ def _build_summary_prompt(messages: list[dict]) -> str:
         "- Preserve: unfinished tasks, goals, user decisions, project info, important context.\n"
         "- Discard: small talk, pleasantries, repetitive exchanges.\n"
         "- Be concise. Use bullet points. No filler.\n\n"
-        f"CONVERSATION:\n{dialog}\n\n"
-        "SUMMARY:"
+        f"CONVERSATION:\n{dialog}\n\nSUMMARY:"
     )
 
 
 def _build_compression_prompt(summaries: list[dict]) -> str:
-    """
-    Build a prompt that merges multiple summaries into one compressed summary.
-    """
     all_text = "\n\n".join(
         f"[{s.get('created_at', '')[:10]}] {s['summary']}" for s in summaries
     )
@@ -101,19 +181,11 @@ def _build_compression_prompt(summaries: list[dict]) -> str:
         "- Eliminate duplicates.\n"
         "- Preserve every unique fact, goal, project, and decision.\n"
         "- Be concise. Use bullet points.\n\n"
-        f"SUMMARIES:\n{all_text}\n\n"
-        "MERGED SUMMARY:"
+        f"SUMMARIES:\n{all_text}\n\nMERGED SUMMARY:"
     )
 
 
-def _build_profile_update_prompt(
-    current_profile: dict,
-    recent_exchange: str,
-) -> str:
-    """
-    Ask the model to extract any new durable facts from the latest exchange
-    and return them as a JSON patch to merge into profile.json.
-    """
+def _build_profile_update_prompt(current_profile: dict, recent_exchange: str) -> str:
     profile_str = json.dumps(current_profile, indent=2, ensure_ascii=False)
     return (
         "You are a user-profile extraction assistant.\n"
@@ -126,33 +198,25 @@ def _build_profile_update_prompt(
         "- If nothing new was discovered, return an empty JSON object: {}\n"
         "- Return ONLY valid JSON. No explanation, no markdown fences.\n\n"
         f"CURRENT PROFILE:\n{profile_str}\n\n"
-        f"LATEST EXCHANGE:\n{recent_exchange}\n\n"
-        "NEW FACTS (JSON):"
+        f"LATEST EXCHANGE:\n{recent_exchange}\n\nNEW FACTS (JSON):"
     )
 
 
 # ── Memory lifecycle ───────────────────────────────────────────────────────────
 
 def _maybe_summarize(memory: MemoryManager) -> None:
-    """
-    If recent.json has grown large enough, summarise and clear it.
-    Optionally compress summaries if there are too many.
-    """
+    """Summarise recent messages if the window is full; compress if needed."""
     if not memory.should_summarize():
         return
-
-    messages = memory.get_recent_messages()
     print("[Jarvis] Compressing conversation memory…")
-
-    summary = _call_llm(_build_summary_prompt(messages))
-    memory.append_summary(summary)  # also clears recent.json
-
-    # If we now have too many summaries, merge the old ones
+    summary = _call_plain(_build_summary_prompt(memory.get_recent_messages()))
+    if summary:
+        memory.append_summary(summary)
     if memory.needs_compression():
         print("[Jarvis] Merging old summaries…")
-        all_summaries = memory.get_all_summaries()
-        compressed = _call_llm(_build_compression_prompt(all_summaries))
-        memory.compress_summaries(compressed)
+        compressed = _call_plain(_build_compression_prompt(memory.get_all_summaries()))
+        if compressed:
+            memory.compress_summaries(compressed)
 
 
 def _maybe_update_profile(
@@ -160,24 +224,17 @@ def _maybe_update_profile(
     user_message: str,
     assistant_reply: str,
 ) -> None:
-    """
-    After each exchange, optionally extract new profile facts.
-    We only call the LLM here — no update occurs if the model returns {}.
-    """
+    """Extract new permanent facts from the latest exchange and update profile.json."""
     exchange = f"USER: {user_message}\nASSISTANT: {assistant_reply}"
-    current_profile = memory.get_profile()
-    prompt = _build_profile_update_prompt(current_profile, exchange)
-
-    raw = _call_llm(prompt)
-
+    raw = _call_plain(_build_profile_update_prompt(memory.get_profile(), exchange))
+    if not raw:
+        return
     try:
-        # Strip any accidental markdown fences before parsing
         clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         updates: dict[str, Any] = json.loads(clean)
         if updates:
             memory.update_profile(updates)
     except json.JSONDecodeError:
-        # Model returned something non-JSON — silently ignore
         pass
 
 
@@ -188,30 +245,33 @@ def generate_response(user_message: str, memory: MemoryManager) -> str:
     Main entry point called from main.py.
 
     Flow:
-      1. Build context (profile + summaries + recent window + current message)
-      2. Call the LLM
-      3. Save the user message and assistant reply to recent.json
-      4. Optionally update the user profile
+      1. Build context as list[BaseMessage] (profile + summaries + recent + current)
+      2. Run the tool-calling loop (LLM decides if tools are needed)
+      3. Persist user message and assistant reply to recent.json
+      4. Optionally update user profile
       5. Optionally trigger summarisation / compression
-      6. Return the reply string
+      6. Return the final text reply
+
+    The tool-calling loop is transparent to main.py — it just receives the
+    final text response regardless of how many tool calls happened internally.
 
     Future extension points:
-      - Step 1: inject RAG-retrieved documents into context
-      - Step 2: add tools/agents via langchain AgentExecutor
-      - Step 4: add TTS call here
-      - After step 6: route response to speech output
+      - RAG: build_messages() can accept retrieved_docs parameter
+      - Vision: add image content to the HumanMessage before the loop
+      - TTS: call your speech engine on the returned reply in main.py
+      - Streaming: replace _run_tool_loop with a streaming equivalent
     """
-    # Build the full context string
-    context = memory.build_context(user_message)
+    # Build native message list
+    messages: list[BaseMessage] = memory.build_messages(user_message)
 
-    # Single LLM call with the assembled context
-    reply = _call_llm(context)
+    # Run tool-calling loop (handles 0 or many tool calls transparently)
+    reply: str = _run_tool_loop(messages)
 
-    # Persist both sides of the exchange immediately
+    # Persist both sides of the exchange immediately (crash-safe)
     memory.add_message("user", user_message)
     memory.add_message("assistant", reply)
 
-    # Background memory maintenance (runs synchronously; fast in practice)
+    # Background memory maintenance
     _maybe_update_profile(memory, user_message, reply)
     _maybe_summarize(memory)
 

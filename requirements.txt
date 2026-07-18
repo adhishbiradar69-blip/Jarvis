@@ -5,3 +5,26 @@ langchain-core>=0.3.0
 
 # Environment variable loading
 python-dotenv>=1.0.0
+
+# ── Tool dependencies (install what you need) ──────────────────────────────────
+
+# Screenshots
+Pillow>=10.0.0
+
+# Clipboard
+pyperclip>=1.8.0
+
+# System stats (battery, network)
+psutil>=5.9.0
+
+# PDF reading
+pypdf>=4.0.0
+
+# DOCX reading
+python-docx>=1.0.0
+
+# Windows volume control (Windows only)
+# pycaw>=20230625
+
+# Screen brightness control
+# screen-brightness-control>=0.22.0
